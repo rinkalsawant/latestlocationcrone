@@ -677,7 +677,7 @@ const trackingCronJob = cron.schedule('0 */4 * * *', async () => {
 });
 
 // Schedule the location history update job to run every 4 hours
-const locationHistoryCronJob = cron.schedule('*/30 * * * * *', async () => {
+const locationHistoryCronJob = cron.schedule('0 */4 * * *', async () => {
     await updateLocationHistory();
 }, {
     scheduled: false,
