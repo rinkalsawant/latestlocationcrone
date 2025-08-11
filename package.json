@@ -1,0 +1,29 @@
+{
+    "name": "vehicle-tracking-cron",
+    "version": "1.0.0",
+    "description": "Cron job for tracking vehicle locations from multiple sources",
+    "main": "trackingcron.js",
+    "scripts": {
+        "start": "node trackingcron.js",
+        "dev": "nodemon trackingcron.js",
+        "test": "node -e \"require('./trackingcron.js').trackAllVehicles()\""
+    },
+    "dependencies": {
+        "@mapbox/polyline": "^1.2.1",
+        "dotenv": "^16.3.1",
+        "mongodb": "^6.18.0",
+        "node-cron": "^3.0.3"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.2"
+    },
+    "keywords": [
+        "cron",
+        "vehicle",
+        "tracking",
+        "mongodb",
+        "location"
+    ],
+    "author": "Your Name",
+    "license": "MIT"
+}
