@@ -66,7 +66,8 @@ async function trackAllVehicles() {
                         { vehicleNumber: { $exists: true, $ne: null, $ne: "" } }
                     ]
                 },
-                { "departureInfo.shippingType": "FTL" }
+                { "departureInfo.shippingType": "FTL" },
+                { status: "in-transit" }
             ]
         }).toArray();
 
@@ -110,7 +111,12 @@ async function updateLocationHistory() {
         const { db } = await connectToDatabase();
 
         // Get all vehicles with departureInfo.shippingType
-        const vehicles = await db.collection('vehicles').find({ "departureInfo.shippingType": "FTL" }).toArray();
+        const vehicles = await db.collection('vehicles').find({
+            $and: [
+                { "departureInfo.shippingType": "FTL" },
+                { status: "in-transit" }
+            ]
+        }).toArray();
         console.log(`Processing ${vehicles.length} vehicles for location history update`);
 
         for (const vehicle of vehicles) {
@@ -127,13 +133,48 @@ async function updateLocationHistory() {
     }
 }
 
+// Helper function to get place name from coordinates using reverse geocoding
+async function getPlaceNameFromCoordinates(latitude, longitude) {
+    try {
+        // Using OpenStreetMap Nominatim API for reverse geocoding
+        const response = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=18&addressdetails=1`,
+            {
+                headers: {
+                    'User-Agent': 'VehicleTrackingApp/1.0'
+                }
+            }
+        );
+
+        if (response.ok) {
+            const data = await response.json();
+            if (data.display_name) {
+                // Extract a shorter, more readable place name
+                const parts = data.display_name.split(', ');
+                if (parts.length >= 2) {
+                    return `${parts[0]}, ${parts[1]}`; // City, State/Country
+                }
+                return data.display_name;
+            }
+        }
+        return null;
+    } catch (error) {
+        console.error('Error in reverse geocoding:', error);
+        return null;
+    }
+}
+
 // Function to extract the latest location from SIM, FASTag, and manual, and store only the latest valid one
 async function extractAndStoreLatestLocation(vehicle, db) {
     const vehicleId = vehicle._id.toString();
     const now = new Date();
 
-    // 1. Try to get new SIM tracking location
-    let simCandidate = null;
+    let candidates = [];
+    let simLog = null, fastTagLog = null, manualLog = null;
+
+    // 1. SIM Tracking API
+    let simLocation = null;
+    let simTimestamp = null;
     try {
         const phoneNumber = vehicle.driverContact || vehicle.phoneNumber || vehicle.contact || null;
         if (phoneNumber) {
@@ -148,22 +189,28 @@ async function extractAndStoreLatestLocation(vehicle, db) {
                     longitude = simResult.data.location.lng;
                 }
                 timestamp = simResult.data.timestamp || new Date().toISOString();
-                if (latitude && longitude && timestamp) {
-                    simCandidate = {
+                simLog = { latitude, longitude, timestamp };
+                if (latitude && longitude) {
+                    // Get place name from coordinates
+                    const placeName = await getPlaceNameFromCoordinates(latitude, longitude);
+                    candidates.push({
                         latitude,
                         longitude,
-                        placeName: null,
+                        placeName: placeName,
                         timestamp,
                         source: 'simTracking',
                         createdAt: now
-                    };
+                    });
                 }
+            } else {
+                simLog = { latitude: null, longitude: null, timestamp: null };
             }
         }
-    } catch (e) { }
+    } catch (e) {
+        simLog = { latitude: null, longitude: null, timestamp: null };
+    }
 
-    // 2. Try to get new FASTag location
-    let fastTagCandidate = null;
+    // 2. FASTag API
     try {
         const vehicleNumber = vehicle.registrationNumber || vehicle.vehicleNumber || vehicle.regNumber || null;
         if (vehicleNumber) {
@@ -183,151 +230,82 @@ async function extractAndStoreLatestLocation(vehicle, db) {
                 }, null);
                 if (latestTxn && latestTxn.tollPlazaGeocode) {
                     const [lat, lng] = latestTxn.tollPlazaGeocode.split(',').map(Number);
+                    fastTagLog = { latitude: lat, longitude: lng, timestamp: latestTxn.readerReadTime };
                     if (!isNaN(lat) && !isNaN(lng)) {
-                        fastTagCandidate = {
+                        // Get place name from coordinates for FASTag too
+                        const placeName = await getPlaceNameFromCoordinates(lat, lng);
+                        candidates.push({
                             latitude: lat,
                             longitude: lng,
-                            placeName: null,
+                            placeName: placeName,
                             timestamp: latestTxn.readerReadTime,
                             source: 'fastTag',
                             createdAt: now
-                        };
+                        });
                     }
+                } else {
+                    fastTagLog = { latitude: null, longitude: null, timestamp: null };
                 }
+            } else {
+                fastTagLog = { latitude: null, longitude: null, timestamp: null };
             }
         }
-    } catch (e) { }
+    } catch (e) {
+        fastTagLog = { latitude: null, longitude: null, timestamp: null };
+    }
 
-    // 3. Get latest manual location from DB
-    let manualCandidate = null;
+    // 3. Manual (from DB locations array)
     if (vehicle.locations && Array.isArray(vehicle.locations) && vehicle.locations.length > 0) {
+        // Find the latest valid manual location
         const manualLatest = [...vehicle.locations].reverse().find(loc => (loc.lat || loc.latitude) && (loc.lng || loc.longitude) && (loc.updatedAt || loc.timestamp));
         if (manualLatest) {
-            manualCandidate = {
+            manualLog = {
                 latitude: manualLatest.lat || manualLatest.latitude,
                 longitude: manualLatest.lng || manualLatest.longitude,
-                placeName: manualLatest.placeName || null,
+                timestamp: manualLatest.updatedAt || manualLatest.timestamp
+            };
+            // Get place name from coordinates for manual location too
+            const placeName = await getPlaceNameFromCoordinates(manualLog.latitude, manualLog.longitude);
+            candidates.push({
+                latitude: manualLatest.lat || manualLatest.latitude,
+                longitude: manualLatest.lng || manualLatest.longitude,
+                placeName: placeName,
                 timestamp: manualLatest.updatedAt || manualLatest.timestamp,
                 source: 'manual',
                 createdAt: now
-            };
-        }
-    }
-
-    // 4. Get previous SIM tracking location from DB
-    let prevSimCandidate = null;
-    if (vehicle.simTrackingLocations && Array.isArray(vehicle.simTrackingLocations) && vehicle.simTrackingLocations.length > 0) {
-        const simPrev = vehicle.simTrackingLocations[vehicle.simTrackingLocations.length - 1];
-        if (simPrev.location && simPrev.timestamp) {
-            prevSimCandidate = {
-                latitude: simPrev.location.lat || simPrev.location.latitude,
-                longitude: simPrev.location.lng || simPrev.location.longitude,
-                placeName: null,
-                timestamp: simPrev.timestamp,
-                source: 'simTracking',
-                createdAt: simPrev.createdAt || now
-            };
-        }
-    }
-
-    // 5. Get previous FASTag location from DB
-    let prevFastTagCandidate = null;
-    if (vehicle.fastTagLocations && Array.isArray(vehicle.fastTagLocations) && vehicle.fastTagLocations.length > 0) {
-        const fastTagPrev = vehicle.fastTagLocations[vehicle.fastTagLocations.length - 1];
-        if (fastTagPrev.location && fastTagPrev.timestamp) {
-            prevFastTagCandidate = {
-                latitude: fastTagPrev.location.lat || fastTagPrev.location.latitude,
-                longitude: fastTagPrev.location.lng || fastTagPrev.location.longitude,
-                placeName: null,
-                timestamp: fastTagPrev.timestamp,
-                source: 'fastTag',
-                createdAt: fastTagPrev.createdAt || now
-            };
-        }
-    }
-
-    // 6. Get previous manual location from DB (from updateLocations)
-    let prevManualCandidate = null;
-    if (vehicle.updateLocations && Array.isArray(vehicle.updateLocations) && vehicle.updateLocations.length > 0) {
-        const updatePrev = vehicle.updateLocations[vehicle.updateLocations.length - 1];
-        if (updatePrev.location && updatePrev.timestamp) {
-            prevManualCandidate = {
-                latitude: updatePrev.location.lat || updatePrev.location.latitude,
-                longitude: updatePrev.location.lng || updatePrev.location.longitude,
-                placeName: updatePrev.placeName || null,
-                timestamp: updatePrev.timestamp,
-                source: 'manual',
-                createdAt: updatePrev.createdAt || now
-            };
-        }
-    }
-
-    // 7. Get last entry in locationHistory
-    let lastHistory = null;
-    if (vehicle.locationHistory && Array.isArray(vehicle.locationHistory) && vehicle.locationHistory.length > 0) {
-        lastHistory = vehicle.locationHistory[vehicle.locationHistory.length - 1];
-    }
-
-    // 8. Collect all candidates
-    const candidates = [simCandidate, fastTagCandidate, manualCandidate, prevSimCandidate, prevFastTagCandidate, prevManualCandidate]
-        .filter(Boolean)
-        .filter(c => c.latitude && c.longitude && c.timestamp);
-
-    // 9. Find the latest by timestamp
-    if (candidates.length > 0) {
-        candidates.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-        const latest = candidates[0];
-        // Only add if it's newer than the last entry in locationHistory
-        if (!lastHistory || new Date(latest.timestamp) > new Date(lastHistory.timestamp)) {
-            await db.collection('vehicles').updateOne(
-                { _id: new ObjectId(vehicleId) },
-                {
-                    $push: {
-                        locationHistory: latest
-                    },
-                    $currentDate: {
-                        updatedAt: { $type: "date" }
-                    }
-                }
-            );
-            console.log(`Updated location history for vehicle ${vehicleId} with ${latest.source} location from ${latest.timestamp}`);
+            });
         } else {
-            // If no newer, but there is a previous latest, store it again
-            await db.collection('vehicles').updateOne(
-                { _id: new ObjectId(vehicleId) },
-                {
-                    $push: {
-                        locationHistory: lastHistory
-                    },
-                    $currentDate: {
-                        updatedAt: { $type: "date" }
-                    }
-                }
-            );
-            console.log(`Re-stored previous latest location for vehicle ${vehicleId}`);
+            manualLog = { latitude: null, longitude: null, timestamp: null };
         }
     } else {
-        // No data at all, store empty entry
-        const emptyEntry = {
-            latitude: null,
-            longitude: null,
-            placeName: null,
-            timestamp: new Date().toISOString(),
-            source: 'none',
-            createdAt: now
-        };
+        manualLog = { latitude: null, longitude: null, timestamp: null };
+    }
+
+    // Print all three logs
+    console.log(`Vehicle ${vehicleId} - SIM:`, simLog);
+    console.log(`Vehicle ${vehicleId} - FASTag:`, fastTagLog);
+    console.log(`Vehicle ${vehicleId} - Manual:`, manualLog);
+
+    // Pick the latest valid one by timestamp
+    const validCandidates = candidates.filter(c => c.latitude && c.longitude && c.timestamp);
+    if (validCandidates.length > 0) {
+        validCandidates.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        const latest = validCandidates[0];
+        console.log(`Vehicle ${vehicleId} - Chosen for locationHistory:`, latest);
         await db.collection('vehicles').updateOne(
             { _id: new ObjectId(vehicleId) },
             {
                 $push: {
-                    locationHistory: emptyEntry
+                    locationHistory: latest
                 },
                 $currentDate: {
                     updatedAt: { $type: "date" }
                 }
             }
         );
-        console.log(`No valid location found for vehicle ${vehicleId}, stored empty entry.`);
+        console.log(`Updated location history for vehicle ${vehicleId} with ${latest.source} location from ${latest.timestamp}`);
+    } else {
+        console.log(`No valid location found for vehicle ${vehicleId}, skipping.`);
     }
 }
 
@@ -460,7 +438,35 @@ async function trackSingleVehicle(vehicle, db) {
 async function callSimTrackingAPI(phoneNumber) {
     const authkey = "Pai0Ffn10MElRrlkPQk1VsGJk1";
 
-    // First subscribe for tracking
+    // Helper to call location API
+    const getLocation = async () => {
+        const locationResponse = await fetch(
+            "https://track.cxipl.com/api/v2/phone-tracking/location",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    authkey: authkey,
+                },
+                body: JSON.stringify({ phoneNumber }),
+            }
+        );
+        const locationData = await locationResponse.json();
+        console.log('SIM Location Response:', locationData);
+        return { ok: locationResponse.ok, body: locationData };
+    };
+
+    // 1) Try to fetch location directly first (avoid sending SMS if already allowed)
+    try {
+        const firstTry = await getLocation();
+        if (firstTry.ok && firstTry.body && firstTry.body.success) {
+            return firstTry.body;
+        }
+    } catch (e) {
+        // ignore and fall through to subscription flow
+    }
+
+    // 2) If direct location failed, subscribe then retry location
     const subscribeResponse = await fetch(
         "https://track.cxipl.com/api/v2/phone-tracking/subscribe",
         {
@@ -488,31 +494,17 @@ async function callSimTrackingAPI(phoneNumber) {
     // Wait a bit for the subscription to take effect
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Get location
-    const locationResponse = await fetch(
-        "https://track.cxipl.com/api/v2/phone-tracking/location",
-        {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                authkey: authkey,
-            },
-            body: JSON.stringify({ phoneNumber }),
-        }
-    );
-
-    const locationData = await locationResponse.json();
-    console.log('SIM Location Response:', locationData);
-
-    if (!locationData.success) {
-        throw new Error(locationData.message || 'Failed to get SIM location');
+    // 3) Retry location after subscribe
+    const secondTry = await getLocation();
+    if (!secondTry.body || !secondTry.body.success) {
+        throw new Error(secondTry.body?.message || 'Failed to get SIM location');
     }
 
-    return locationData;
+    return secondTry.body;
 }
 
 async function callFastTagAPI(vehicleNumber) {
-    const apiUrl = "https://chatwithpdf.in/verify/fastag";
+    const apiUrl = "https://bot.scmapml.com/verify/fastag";
     const payload = JSON.stringify({ vehiclenumber: vehicleNumber });
     const headers = {
         'Content-Type': 'application/json',
