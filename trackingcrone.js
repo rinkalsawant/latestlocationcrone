@@ -576,6 +576,9 @@ async function saveToDatabase(vehicleId, trackingData, db) {
             }
         };
 
+        // Only store in locationHistory, not in separate arrays
+        const locationHistoryEntries = [];
+
         // Update SIM tracking data if available
         if (trackingData.simTracking.location) {
             updateDocument.$set.simTracking = {
@@ -584,45 +587,50 @@ async function saveToDatabase(vehicleId, trackingData, db) {
                 status: trackingData.simTracking.status
             };
 
-            // Add to simTrackingLocations array
-            updateDocument.$push = updateDocument.$push || {};
-            updateDocument.$push.simTrackingLocations = {
-                location: trackingData.simTracking.location,
+            // Add to locationHistory instead of simTrackingLocations
+            locationHistoryEntries.push({
+                latitude: trackingData.simTracking.location.lat,
+                longitude: trackingData.simTracking.location.lng,
                 timestamp: trackingData.simTracking.timestamp,
-                status: trackingData.simTracking.status,
+                source: 'simTracking',
+                placeName: null, // Will be populated by reverse geocoding in location history cron
                 createdAt: now
-            };
+            });
         }
 
         // Update FASTag data if available
         if (trackingData.fastTag.location) {
-            updateDocument.$set.fasttagTransactions = [{
-                txn: trackingData.fastTag.rawResponse?.data || [],
-                timestamp: now,
-                rawResponse: [trackingData.fastTag.rawResponse]
-            }];
             updateDocument.$set.fasttagLastUpdated = now;
             updateDocument.$set.fasttagStatus = 'success';
 
-            // Add to fastTagLocations array
-            updateDocument.$push = updateDocument.$push || {};
-            updateDocument.$push.fastTagLocations = {
-                location: trackingData.fastTag.location,
+            // Add to locationHistory
+            locationHistoryEntries.push({
+                latitude: trackingData.fastTag.location.lat,
+                longitude: trackingData.fastTag.location.lng,
                 timestamp: trackingData.fastTag.timestamp,
-                status: trackingData.fastTag.status,
+                source: 'fastTag',
+                placeName: null, // Will be populated by reverse geocoding in location history cron
                 createdAt: now
-            };
+            });
         }
 
         // Update Update Location data if available
         if (trackingData.updateLocation?.location) {
-            // Add to updateLocations array
-            updateDocument.$push = updateDocument.$push || {};
-            updateDocument.$push.updateLocations = {
-                location: trackingData.updateLocation.location,
-                placeName: trackingData.updateLocation.placeName,
+            // Add to locationHistory instead of updateLocations
+            locationHistoryEntries.push({
+                latitude: trackingData.updateLocation.location.lat,
+                longitude: trackingData.updateLocation.location.lng,
                 timestamp: trackingData.updateLocation.timestamp,
+                source: 'manual',
+                placeName: trackingData.updateLocation.placeName,
                 createdAt: now
+            });
+        }
+
+        // Only add to locationHistory if we have valid location data
+        if (locationHistoryEntries.length > 0) {
+            updateDocument.$push = {
+                locationHistory: { $each: locationHistoryEntries }
             };
         }
 
@@ -661,15 +669,15 @@ function formatTimeDifference(diffMs) {
 console.log('Starting vehicle tracking cron job...');
 
 // Schedule the tracking job to run every 4 hours instead of every minute
-const trackingCronJob = cron.schedule('0 */4 * * *', async () => {
+const trackingCronJob = cron.schedule('*/4 * * * *', async () => {
     await trackAllVehicles();
 }, {
     scheduled: false,
     timezone: "Asia/Kolkata" // Adjust timezone as needed
 });
 
-// Schedule the location history update job to run every 4 hours
-const locationHistoryCronJob = cron.schedule('0 */4 * * *', async () => {
+// Schedule the location history update job to run ever*/30 * * * * *y 4 hours
+const locationHistoryCronJob = cron.schedule('*/4 * * * *', async () => {
     await updateLocationHistory();
 }, {
     scheduled: false,
