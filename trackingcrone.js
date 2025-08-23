@@ -669,7 +669,7 @@ function formatTimeDifference(diffMs) {
 console.log('Starting vehicle tracking cron job...');
 
 // Schedule the tracking job to run every 4 hours instead of every minute
-const trackingCronJob = cron.schedule('*/4 * * * *', async () => {
+const trackingCronJob = cron.schedule('0 */4 * * *', async () => {
     await trackAllVehicles();
 }, {
     scheduled: false,
@@ -677,7 +677,7 @@ const trackingCronJob = cron.schedule('*/4 * * * *', async () => {
 });
 
 // Schedule the location history update job to run ever*/30 * * * * *y 4 hours
-const locationHistoryCronJob = cron.schedule('*/4 * * * *', async () => {
+const locationHistoryCronJob = cron.schedule('0 */4 * * *', async () => {
     await updateLocationHistory();
 }, {
     scheduled: false,
